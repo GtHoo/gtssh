@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""gtssh — Cluster SSH: open multiple xterm windows with a shared control input."""
+
+import argparse
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import tempfile
+from pathlib import Path
+import tkinter as tk
+
+CONFIG_DIR = Path.home() / '.gtssh'
+CLUSTERS_FILE = CONFIG_DIR / 'clusters'
+
+# ---------------------------------------------------------------------------
+# Relay script — written to a temp file, executed inside each xterm window.
+# It runs inside xterm's pty, opens its own pty for SSH, and bridges:
+#   xterm keyboard  ─┐
+#   Unix socket      ├─► SSH master pty ─► SSH ─► slave pty ─► SSH output ─► xterm display
+# ---------------------------------------------------------------------------
+RELAY_SCRIPT = r'''#!/usr/bin/env python3
+"""gtssh relay — runs inside xterm, bridges keyboard+socket → SSH."""
+import os, sys, pty, socket as sock_mod, select, subprocess
+import termios, tty, signal, struct, fcntl
+
+def main():
+    if len(sys.argv) < 3:
+        print("usage: relay.py SOCKET_PATH ssh-cmd...", file=sys.stderr)
+        sys.exit(1)
+
+    socket_path = sys.argv[1]
+    ssh_cmd     = sys.argv[2:]
+
+    # Create a pty pair for SSH so we can inject broadcast data into its stdin
+    master_fd, slave_fd = pty.openpty()
+
+    # Propagate xterm window size to SSH's pty
+    def set_pty_size():
+        try:
+            buf = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b'\x00' * 8)
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, buf)
+        except Exception:
+            pass
+
+    set_pty_size()
+    signal.signal(signal.SIGWINCH, lambda *_: set_pty_size())
+
+    ssh_proc = subprocess.Popen(
+        ssh_cmd,
+        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        close_fds=True,
+        preexec_fn=os.setsid,
+    )
+    os.close(slave_fd)
+
+    # Unix socket server for broadcast commands from main process
+    server = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+    server.bind(socket_path)
+    server.listen(8)
+    server.setblocking(False)
+
+    stdin_fd  = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+
+    # Put xterm's stdin into raw mode so we see every keystroke immediately
+    try:
+        old_settings = termios.tcgetattr(stdin_fd)
+        tty.setraw(stdin_fd)
+    except termios.error:
+        old_settings = None
+
+    clients = []
+
+    def cleanup():
+        if old_settings is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+        server.close()
+        try:
+            os.unlink(socket_path)
+        except Exception:
+            pass
+        for c in clients:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    try:
+        while ssh_proc.poll() is None:
+            watch = [stdin_fd, master_fd, server] + clients
+            try:
+                readable, _, _ = select.select(watch, [], [], 0.5)
+            except (ValueError, OSError):
+                break
+
+            for item in readable:
+                # --- keyboard input from xterm ---
+                if item == stdin_fd:
+                    try:
+                        data = os.read(stdin_fd, 256)
+                    except OSError:
+                        data = b''
+                    if data:
+                        try:
+                            os.write(master_fd, data)
+                        except OSError:
+                            pass
+
+                # --- output from SSH ---
+                elif item == master_fd:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if data:
+                        try:
+                            os.write(stdout_fd, data)
+                        except OSError:
+                            pass
+
+                # --- new broadcast client connecting ---
+                elif item is server:
+                    try:
+                        client, _ = server.accept()
+                        client.setblocking(False)
+                        clients.append(client)
+                    except OSError:
+                        pass
+
+                # --- broadcast data from main process ---
+                elif item in clients:
+                    try:
+                        data = item.recv(4096)
+                    except OSError:
+                        data = b''
+                    if data:
+                        try:
+                            os.write(master_fd, data)
+                        except OSError:
+                            pass
+                    else:
+                        try:
+                            item.close()
+                        except Exception:
+                            pass
+                        clients.remove(item)
+
+    finally:
+        cleanup()
+
+if __name__ == '__main__':
+    main()
+'''
+
+# Tkinter keysym → bytes to send to the terminal
+CTRL_MAP = {
+    'a': b'\x01', 'b': b'\x02', 'c': b'\x03', 'd': b'\x04', 'e': b'\x05',
+    'f': b'\x06', 'g': b'\x07', 'h': b'\x08', 'i': b'\x09', 'j': b'\x0a',
+    'k': b'\x0b', 'l': b'\x0c', 'm': b'\x0d', 'n': b'\x0e', 'o': b'\x0f',
+    'p': b'\x10', 'q': b'\x11', 'r': b'\x12', 's': b'\x13', 't': b'\x14',
+    'u': b'\x15', 'v': b'\x16', 'w': b'\x17', 'x': b'\x18', 'y': b'\x19',
+    'z': b'\x1a',
+}
+SPECIAL_MAP = {
+    'Return':    b'\r',
+    'KP_Enter':  b'\r',
+    'Tab':       b'\t',
+    'Escape':    b'\x1b',
+    'BackSpace': b'\x7f',
+    'Delete':    b'\x1b[3~',
+    'Up':        b'\x1b[A',
+    'Down':      b'\x1b[B',
+    'Right':     b'\x1b[C',
+    'Left':      b'\x1b[D',
+    'Home':      b'\x1b[H',
+    'End':       b'\x1b[F',
+    'Prior':     b'\x1b[5~',
+    'Next':      b'\x1b[6~',
+    'F1':        b'\x1bOP',
+    'F2':        b'\x1bOQ',
+    'F3':        b'\x1bOR',
+    'F4':        b'\x1bOS',
+    'F5':        b'\x1b[15~',
+    'F6':        b'\x1b[17~',
+    'F7':        b'\x1b[18~',
+    'F8':        b'\x1b[19~',
+    'F9':        b'\x1b[20~',
+    'F10':       b'\x1b[21~',
+    'F11':       b'\x1b[23~',
+    'F12':       b'\x1b[24~',
+}
+
+
+# ---------------------------------------------------------------------------
+# Host connection
+# ---------------------------------------------------------------------------
+
+class HostConnection:
+    def __init__(self, host, ssh_args, relay_path):
+        self.host       = host
+        self.ssh_args   = ssh_args
+        self.relay_path = relay_path
+        self.socket_path = f'/tmp/gtssh-{os.getpid()}-{host}.sock'
+        self.xterm_proc = None
+        self._sock      = None   # persistent socket to relay
+        self.active     = True
+
+    def start(self):
+        cmd = [
+            'xterm',
+            '-title', f'gtssh: {self.host}',
+            '-bg', 'black', '-fg', '#00cc00',
+            '-fa', 'Monospace', '-fs', '10',
+            '-sb',
+            '-e',
+            'python3', self.relay_path, self.socket_path,
+            'ssh', *self.ssh_args, self.host,
+        ]
+        self.xterm_proc = subprocess.Popen(cmd)
+
+        # Wait for relay to create its Unix socket (signals it's ready)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if os.path.exists(self.socket_path):
+                break
+            if self.xterm_proc.poll() is not None:
+                raise RuntimeError(f'xterm exited before relay started for {self.host}')
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f'relay socket never appeared for {self.host}')
+
+        # Small extra pause so the relay's socket.listen() is ready
+        time.sleep(0.05)
+
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.connect(self.socket_path)
+
+    def send(self, data: bytes):
+        if not self.active or self._sock is None:
+            return
+        try:
+            self._sock.sendall(data)
+        except OSError:
+            self._sock = None
+
+    def reconnect(self):
+        """Close any dead resources and start fresh."""
+        self.close()
+        self.start()
+
+    def is_alive(self) -> bool:
+        return self.xterm_proc is not None and self.xterm_proc.poll() is None
+
+    def close(self):
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if self.xterm_proc and self.xterm_proc.poll() is None:
+            try:
+                self.xterm_proc.terminate()
+            except ProcessLookupError:
+                pass
+        for path in (self.socket_path,):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Control window
+# ---------------------------------------------------------------------------
+
+class ControlWindow:
+    BG       = '#1e1e2e'
+    FG       = '#cdd6f4'
+    BTN_ON   = '#a6e3a1'
+    BTN_OFF  = '#585b70'
+    BTN_DEAD = '#f38ba8'
+    INPUT_BG = '#313244'
+    PROMPT_FG= '#89b4fa'
+
+    def __init__(self, connections: list):
+        self.connections = connections
+        self.root = tk.Tk()
+        self.root.title(f'gtssh — {len(connections)} host(s)')
+        self.root.configure(bg=self.BG)
+        self.root.resizable(False, False)
+        self._build_ui()
+        self.root.protocol('WM_DELETE_WINDOW', self._on_quit)
+        self.root.after(1000, self._poll)
+
+    # How many host buttons per row before wrapping
+    COLS = 8
+
+    def _build_ui(self):
+        header = tk.Frame(self.root, bg=self.BG, padx=8, pady=4)
+        header.pack(fill='x')
+
+        tk.Label(header, text='gtssh', bg=self.BG, fg=self.PROMPT_FG,
+                 font=('Monospace', 10, 'bold')).pack(side='left', padx=(0, 10))
+
+        tk.Button(header, text='Quit', bg='#45475a', fg=self.FG,
+                  activebackground='#f38ba8', activeforeground=self.BG,
+                  relief='flat', padx=6, command=self._on_quit
+                  ).pack(side='right', padx=4)
+
+        tk.Label(header, text=f'{len(self.connections)} host(s)',
+                 bg=self.BG, fg='#6c7086',
+                 font=('Monospace', 8)).pack(side='right', padx=8)
+
+        # Scrollable host-button grid
+        self._host_btns: dict = {}
+        rows = (len(self.connections) + self.COLS - 1) // self.COLS
+        btn_frame = tk.Frame(self.root, bg=self.BG, padx=8, pady=4)
+        btn_frame.pack(fill='x')
+        for i, conn in enumerate(self.connections):
+            self._add_host_btn(btn_frame, conn, row=i // self.COLS, col=i % self.COLS)
+
+        inp = tk.Frame(self.root, bg=self.INPUT_BG, pady=4, padx=8)
+        inp.pack(fill='x')
+
+        tk.Label(inp, text='>', bg=self.INPUT_BG, fg=self.PROMPT_FG,
+                 font=('Monospace', 11, 'bold')).pack(side='left', padx=(0, 6))
+
+        self._display_var = tk.StringVar()
+        self._entry = tk.Entry(inp, textvariable=self._display_var,
+                               bg=self.INPUT_BG, fg=self.FG,
+                               insertbackground=self.FG, relief='flat',
+                               font=('Monospace', 11), width=60)
+        self._entry.pack(side='left', fill='x', expand=True)
+        self._entry.bind('<Key>', self._on_key, add=False)
+        self._entry.bind('<Control-Key>', self._on_ctrl, add=False)
+        self._entry.focus_set()
+
+        self._status_var = tk.StringVar(value=self._status())
+        tk.Label(self.root, textvariable=self._status_var,
+                 bg=self.BG, fg='#6c7086', font=('Monospace', 8),
+                 anchor='w', padx=8).pack(fill='x')
+
+    def _add_host_btn(self, parent, conn, row=0, col=0):
+        btn = tk.Button(parent, text=f'● {conn.host}',
+                        bg=self.BTN_ON, fg=self.BG,
+                        activebackground=self.BTN_OFF, activeforeground=self.FG,
+                        relief='flat', padx=6, pady=2, font=('Monospace', 9),
+                        command=lambda c=conn: self._toggle(c))
+        btn.grid(row=row, column=col, padx=2, pady=1, sticky='w')
+        self._host_btns[conn] = btn
+
+    # ── key handling ────────────────────────────────────────────────────
+
+    def _on_key(self, event):
+        if event.state & 0x4:     # Ctrl — handled by _on_ctrl
+            return 'break'
+        keysym = event.keysym
+        if keysym in SPECIAL_MAP:
+            self._broadcast(SPECIAL_MAP[keysym])
+            if keysym in ('Return', 'KP_Enter'):
+                self._display_var.set('')
+            elif keysym == 'BackSpace':
+                self._display_var.set(self._display_var.get()[:-1])
+            return 'break'
+        ch = event.char
+        if ch and ch.isprintable():
+            self._broadcast(ch.encode('utf-8', errors='replace'))
+            self._display_var.set(self._display_var.get() + ch)
+            return 'break'
+        return 'break'
+
+    def _on_ctrl(self, event):
+        ch = event.keysym.lower()
+        if ch in CTRL_MAP:
+            self._broadcast(CTRL_MAP[ch])
+        return 'break'
+
+    def _broadcast(self, data: bytes):
+        for conn in self.connections:
+            if conn.active:
+                conn.send(data)
+
+    # ── host toggle ─────────────────────────────────────────────────────
+
+    def _toggle(self, conn):
+        btn = self._host_btns[conn]
+        if not conn.is_alive():
+            # Dead — reconnect in a thread so the UI doesn't freeze
+            btn.configure(bg='#fab387', text=f'↻ {conn.host}')  # orange = connecting
+            self._status_var.set(f'reconnecting to {conn.host}…')
+            import threading
+            def _do_reconnect():
+                try:
+                    conn.reconnect()
+                    conn.active = True
+                    self.root.after(0, lambda: btn.configure(
+                        bg=self.BTN_ON, fg=self.BG, text=f'● {conn.host}'))
+                except Exception as e:
+                    self.root.after(0, lambda: btn.configure(
+                        bg=self.BTN_DEAD, fg=self.BG, text=f'✕ {conn.host}'))
+                self.root.after(0, lambda: self._status_var.set(self._status()))
+            threading.Thread(target=_do_reconnect, daemon=True).start()
+            return
+        conn.active = not conn.active
+        if conn.active:
+            btn.configure(bg=self.BTN_ON,  text=f'● {conn.host}')
+        else:
+            btn.configure(bg=self.BTN_OFF, text=f'○ {conn.host}')
+        self._status_var.set(self._status())
+
+    # ── health poll ─────────────────────────────────────────────────────
+
+    def _poll(self):
+        changed = False
+        all_dead = True
+        for conn in self.connections:
+            btn = self._host_btns[conn]
+            if not conn.is_alive():
+                if btn.cget('bg') != self.BTN_DEAD:
+                    conn.active = False
+                    btn.configure(bg=self.BTN_DEAD, fg=self.BG,
+                                  text=f'✕ {conn.host}')
+                    changed = True
+            else:
+                all_dead = False
+        if changed:
+            self._status_var.set(self._status())
+        self.root.after(1000, self._poll)
+
+    def _status(self):
+        active = sum(1 for c in self.connections if c.active and c.is_alive())
+        total  = len(self.connections)
+        return f'broadcasting to {active}/{total} hosts  (click a button to toggle)'
+
+    # ── quit ────────────────────────────────────────────────────────────
+
+    def _on_quit(self):
+        for conn in self.connections:
+            conn.close()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def load_clusters():
+    clusters = {}
+    if not CLUSTERS_FILE.exists():
+        return clusters
+    with open(CLUSTERS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                clusters[parts[0]] = parts[1:]
+    return clusters
+
+
+def resolve_hosts(args_hosts, clusters):
+    hosts = []
+    for arg in args_hosts:
+        if arg.startswith('@'):
+            name = arg[1:]
+            if name in clusters:
+                hosts.extend(clusters[name])
+            else:
+                print(f'warning: cluster @{name} not found', file=sys.stderr)
+        else:
+            hosts.append(arg)
+    return hosts
+
+
+def cmd_list(clusters):
+    if not clusters:
+        print(f'No clusters defined. Add them to {CLUSTERS_FILE}')
+        return
+    for name, hosts in clusters.items():
+        print(f'  @{name}:  {" ".join(hosts)}')
+
+
+def cmd_init():
+    CONFIG_DIR.mkdir(exist_ok=True)
+    if CLUSTERS_FILE.exists():
+        print(f'Config already exists: {CLUSTERS_FILE}')
+        return
+    CLUSTERS_FILE.write_text(
+        '# gtssh clusters file\n'
+        '# Format: cluster_name host1 host2 ...\n'
+        '# Use @cluster_name on the command line.\n'
+        '#\n'
+        '# Examples:\n'
+        '# webservers  web1.example.com web2.example.com\n'
+        '# dbservers   user@db1.example.com user@db2.example.com\n'
+    )
+    print(f'Created: {CLUSTERS_FILE}')
+
+
+# ---------------------------------------------------------------------------
+# Requirements
+# ---------------------------------------------------------------------------
+
+def check_requirements():
+    if not shutil.which('xterm'):
+        print('Error: xterm is required.  sudo apt install xterm', file=sys.stderr)
+        sys.exit(1)
+    if not os.environ.get('DISPLAY') and not os.environ.get('WAYLAND_DISPLAY'):
+        print('Error: no X display (DISPLAY is not set)', file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='gtssh',
+        description='Connect to multiple SSH hosts in separate xterm windows.',
+        epilog=(
+            'Examples:\n'
+            '  gtssh host1 host2 host3\n'
+            '  gtssh -l admin host1 @webservers\n'
+            '  gtssh --list\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('hosts', nargs='*', help='hosts or @cluster names')
+    parser.add_argument('-l', '--login',    help='SSH login username')
+    parser.add_argument('-p', '--port',     help='SSH port')
+    parser.add_argument('-i', '--identity', help='SSH identity file')
+    parser.add_argument('-o', '--option',   action='append', default=[],
+                        metavar='OPT',      help='extra SSH option (repeatable)')
+    parser.add_argument('--list', action='store_true', help='list configured clusters')
+    parser.add_argument('--init', action='store_true', help='create ~/.gtssh/clusters')
+
+    args = parser.parse_args()
+    clusters = load_clusters()
+
+    if args.init:
+        cmd_init()
+        return
+    if args.list:
+        cmd_list(clusters)
+        return
+    if not args.hosts:
+        parser.print_help()
+        sys.exit(1)
+
+    check_requirements()
+
+    hosts = resolve_hosts(args.hosts, clusters)
+    if not hosts:
+        print('Error: no hosts to connect to.', file=sys.stderr)
+        sys.exit(1)
+
+    ssh_args = []
+    if args.login:    ssh_args += ['-l', args.login]
+    if args.port:     ssh_args += ['-p', args.port]
+    if args.identity: ssh_args += ['-i', args.identity]
+    for opt in args.option:
+        ssh_args += ['-o', opt]
+
+    # Write relay script to a temp file (cleaned up on exit)
+    relay_fd, relay_path = tempfile.mkstemp(prefix='gtssh-relay-', suffix='.py')
+    try:
+        os.write(relay_fd, RELAY_SCRIPT.encode())
+        os.close(relay_fd)
+        os.chmod(relay_path, 0o755)
+
+        connections = []
+        print(f'Connecting to {len(hosts)} host(s): {", ".join(hosts)}')
+        for host in hosts:
+            conn = HostConnection(host, ssh_args, relay_path)
+            try:
+                conn.start()
+                connections.append(conn)
+                print(f'  ready: {host}')
+            except Exception as e:
+                print(f'  failed {host}: {e}', file=sys.stderr)
+
+        if not connections:
+            print('No connections established.', file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            ControlWindow(connections).run()
+        finally:
+            for conn in connections:
+                conn.close()
+
+    finally:
+        try:
+            os.unlink(relay_path)
+        except OSError:
+            pass
+
+
+if __name__ == '__main__':
+    main()
