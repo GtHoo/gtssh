@@ -521,6 +521,41 @@ def check_requirements():
         sys.exit(1)
 
 
+def check_tmux_requirements():
+    if not shutil.which('tmux'):
+        print('Error: tmux is required.  sudo apt install tmux', file=sys.stderr)
+        sys.exit(1)
+
+
+def run_tmux_mode(hosts, ssh_args):
+    session = f'gtssh-{os.getpid()}'
+    ssh_prefix = ['ssh'] + ssh_args
+
+    # Create session with first host
+    subprocess.run([
+        'tmux', 'new-session', '-d', '-s', session,
+        '-n', 'gtssh',
+        *ssh_prefix, hosts[0],
+    ], check=True)
+
+    # Add remaining hosts as panes
+    for host in hosts[1:]:
+        subprocess.run([
+            'tmux', 'split-window', '-t', session,
+            *ssh_prefix, host,
+        ], check=True)
+        subprocess.run(['tmux', 'select-layout', '-t', session, 'tiled'], check=True)
+
+    # Enable synchronize-panes so keystrokes broadcast to all panes
+    subprocess.run([
+        'tmux', 'set-window-option', '-t', session, 'synchronize-panes', 'on',
+    ], check=True)
+
+    print(f'Attaching to tmux session "{session}" with synchronize-panes enabled.')
+    print('Toggle broadcast: Ctrl-b then :setw synchronize-panes off/on')
+    subprocess.run(['tmux', 'attach-session', '-t', session])
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -543,6 +578,7 @@ def main():
     parser.add_argument('-i', '--identity', help='SSH identity file')
     parser.add_argument('-o', '--option',   action='append', default=[],
                         metavar='OPT',      help='extra SSH option (repeatable)')
+    parser.add_argument('--tmux',  action='store_true', help='use tmux panes instead of xterm windows')
     parser.add_argument('--list', action='store_true', help='list configured clusters')
     parser.add_argument('--init', action='store_true', help='create ~/.gtssh/clusters')
 
@@ -559,8 +595,6 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    check_requirements()
-
     hosts = resolve_hosts(args.hosts, clusters)
     if not hosts:
         print('Error: no hosts to connect to.', file=sys.stderr)
@@ -572,6 +606,13 @@ def main():
     if args.identity: ssh_args += ['-i', args.identity]
     for opt in args.option:
         ssh_args += ['-o', opt]
+
+    if args.tmux:
+        check_tmux_requirements()
+        run_tmux_mode(hosts, ssh_args)
+        return
+
+    check_requirements()
 
     # Write relay script to a temp file (cleaned up on exit)
     relay_fd, relay_path = tempfile.mkstemp(prefix='gtssh-relay-', suffix='.py')
