@@ -16,11 +16,11 @@ simultaneously.
 ## Requirements
 
 - Python 3 (stdlib only — `tkinter`, `pty`, `socket`, …)
-- `xterm`
+- `xterm` (default mode) or `tmux` (tmux mode)
 
 ```bash
-sudo apt install xterm   # Debian/Ubuntu
-sudo dnf install xterm   # Fedora/RHEL
+sudo apt install xterm tmux   # Debian/Ubuntu
+sudo dnf install xterm tmux   # Fedora/RHEL
 ```
 
 ## Usage
@@ -31,6 +31,10 @@ sudo dnf install xterm   # Fedora/RHEL
 ./gtssh -l admin host1 host2
 ./gtssh -p 2222 -i ~/.ssh/mykey host1 host2
 ./gtssh host1 @webservers host2      # mix direct hosts and cluster groups
+
+# tmux mode — tiled panes, no X display required
+./gtssh --tmux @webservers
+./gtssh --tmux host1 host2
 ```
 
 ### Options
@@ -41,10 +45,11 @@ sudo dnf install xterm   # Fedora/RHEL
 | `-p PORT` | SSH port |
 | `-i FILE` | SSH identity file |
 | `-o OPT` | Extra SSH option (repeatable) |
+| `--tmux` | Use tmux panes instead of xterm windows |
 | `--list` | List configured cluster groups |
 | `--init` | Create `~/.gtssh/clusters` config file |
 
-## Control window
+## Control window (xterm mode)
 
 | Action | Effect |
 |--------|--------|
@@ -58,6 +63,18 @@ sudo dnf install xterm   # Fedora/RHEL
 All special keys are forwarded: arrows, `Tab`, `Escape`, `Ctrl+C/D/Z`, F-keys, etc.
 
 You can still type directly in any individual xterm window to send to just that host.
+
+## Tmux mode
+
+`--tmux` opens all hosts as tiled panes in a single tmux session with `synchronize-panes` enabled — keystrokes are broadcast to all panes simultaneously. No X display needed.
+
+| Action | Effect |
+|--------|--------|
+| Type anything | Broadcast to all panes |
+| `Ctrl-b :setw synchronize-panes off` | Disable broadcast |
+| `Ctrl-b :setw synchronize-panes on` | Re-enable broadcast |
+| `Ctrl-b q` | Show pane numbers |
+| `Ctrl-b d` | Detach session |
 
 ## Cluster groups
 
