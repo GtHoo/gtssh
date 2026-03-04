@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -509,6 +510,75 @@ def cmd_init():
 
 
 # ---------------------------------------------------------------------------
+# Proxmox sync
+# ---------------------------------------------------------------------------
+
+VMLIST_SEARCH = [
+    Path.home() / 'claude/git-AI/scripts/vm-list.sh',
+    Path('/usr/local/bin/vm-list.sh'),
+    Path('/usr/local/bin/vm-list'),
+]
+
+
+def save_cluster(name, hosts):
+    CONFIG_DIR.mkdir(exist_ok=True)
+    lines = []
+    found = False
+    if CLUSTERS_FILE.exists():
+        for line in CLUSTERS_FILE.read_text().splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                parts = stripped.split()
+                if parts[0] == name:
+                    lines.append(f'{name}  {" ".join(hosts)}')
+                    found = True
+                    continue
+            lines.append(line)
+    if not found:
+        lines.append(f'{name}  {" ".join(hosts)}')
+    CLUSTERS_FILE.write_text('\n'.join(lines) + '\n')
+
+
+def cmd_proxmox_sync(target, cluster_name, vmlist_path):
+    script = vmlist_path
+    if script is None:
+        for c in VMLIST_SEARCH:
+            if c.exists():
+                script = str(c)
+                break
+    if script is None:
+        script = shutil.which('vm-list.sh') or shutil.which('vm-list')
+    if script is None:
+        print('Error: vm-list.sh not found. Use --vmlist to specify its path.', file=sys.stderr)
+        sys.exit(1)
+
+    print(f'Running {script} {target} …')
+    result = subprocess.run([script, target], capture_output=True, text=True)
+    if not result.stdout and result.returncode != 0:
+        print(f'Error:\n{result.stderr}', file=sys.stderr)
+        sys.exit(1)
+
+    ips = []
+    for line in result.stdout.splitlines():
+        if '|' not in line or 'running' not in line:
+            continue
+        ip_part = line.split('|')[-1].strip()
+        for token in ip_part.split():
+            if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', token):
+                ips.append(token)
+
+    if not ips:
+        print('No running VMs with IPs found.')
+        return
+
+    CONFIG_DIR.mkdir(exist_ok=True)
+    if not CLUSTERS_FILE.exists():
+        cmd_init()
+    save_cluster(cluster_name, ips)
+    print(f'Updated @{cluster_name}: {" ".join(ips)}')
+
+
+# ---------------------------------------------------------------------------
 # Requirements
 # ---------------------------------------------------------------------------
 
@@ -581,6 +651,12 @@ def main():
     parser.add_argument('--tmux',  action='store_true', help='use tmux panes instead of xterm windows')
     parser.add_argument('--list', action='store_true', help='list configured clusters')
     parser.add_argument('--init', action='store_true', help='create ~/.gtssh/clusters')
+    parser.add_argument('--proxmox-sync', nargs='?', const='@hypervisor', metavar='TARGET',
+                        help='sync running VM IPs from Proxmox into a cluster (default target: @hypervisor)')
+    parser.add_argument('--cluster-name', default='proxmox',
+                        help='cluster name to write when using --proxmox-sync (default: proxmox)')
+    parser.add_argument('--vmlist', metavar='PATH',
+                        help='path to vm-list.sh (auto-detected if omitted)')
 
     args = parser.parse_args()
     clusters = load_clusters()
@@ -590,6 +666,9 @@ def main():
         return
     if args.list:
         cmd_list(clusters)
+        return
+    if args.proxmox_sync is not None:
+        cmd_proxmox_sync(args.proxmox_sync, args.cluster_name, args.vmlist)
         return
     if not args.hosts:
         parser.print_help()

@@ -48,6 +48,9 @@ sudo dnf install xterm tmux   # Fedora/RHEL
 | `--tmux` | Use tmux panes instead of xterm windows |
 | `--list` | List configured cluster groups |
 | `--init` | Create `~/.gtssh/clusters` config file |
+| `--proxmox-sync [TARGET]` | Sync running VM IPs from Proxmox into a cluster group (default target: `@hypervisor`) |
+| `--cluster-name NAME` | Cluster name to write when using `--proxmox-sync` (default: `proxmox`) |
+| `--vmlist PATH` | Path to `vm-list.sh` (auto-detected if omitted) |
 
 ## Control window (xterm mode)
 
@@ -92,6 +95,40 @@ Use groups on the command line:
 ./gtssh @webservers
 ./gtssh @webservers @dbservers
 ./gtssh @webservers extra-host.example.com
+```
+
+## Proxmox integration
+
+`--proxmox-sync` queries a Proxmox host via `vm-list.sh`, extracts IPs of all
+running VMs and containers, and saves them as a named cluster in `~/.gtssh/clusters`.
+
+```bash
+# Sync @hypervisor group → saves as @proxmox cluster
+./gtssh --proxmox-sync
+
+# Sync a specific host or group
+./gtssh --proxmox-sync proxmox-node1
+./gtssh --proxmox-sync @hypervisor --cluster-name myvms
+
+# Specify vm-list.sh location explicitly
+./gtssh --proxmox-sync --vmlist /path/to/vm-list.sh
+
+# Then connect to all synced VMs
+./gtssh @proxmox
+./gtssh --tmux @proxmox
+```
+
+`vm-list.sh` connects to Proxmox over SSH. It tries users in this order:
+
+1. `root` (default)
+2. Username from `~/.servers/config` (`SSH_USER=myuser`)
+3. Current `$USER`
+
+Proxmox hosts are defined in `~/.servers/hosts`:
+
+```
+# name|ip|uri|desc|groups
+proxmox|192.168.10.101|||hypervisor
 ```
 
 ## How it works
